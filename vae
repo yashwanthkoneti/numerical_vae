@@ -4,19 +4,36 @@ import joblib
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
 
 
 class FinancialVAE(nn.Module):
+    """
+    Encoder Input      : Behaviour + Missing Indicators
+    Decoder Target     : Behaviour Only
 
-    def __init__(self, input_dim, latent_dim=8, hidden_dims=None,
-                 beta=1.0, lr=1e-3, batch_size=512,
-                 epochs=30, patience=5, device=None):
+    input_dim          : Total encoder input dimension
+    reconstruction_dim : Number of behavioural features to reconstruct
+    """
 
+    def __init__(
+        self,
+        input_dim,
+        reconstruction_dim,
+        latent_dim=8,
+        hidden_dims=None,
+        beta=1.0,
+        lr=1e-3,
+        batch_size=512,
+        epochs=30,
+        patience=5,
+        device=None
+    ):
         super().__init__()
 
         self.input_dim = input_dim
+        self.reconstruction_dim = reconstruction_dim
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims or [2 * input_dim, input_dim]
         self.beta = beta
@@ -27,21 +44,23 @@ class FinancialVAE(nn.Module):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.history = {"train": [], "val": [], "recon": [], "kl": []}
 
+        # -------- Encoder --------
         enc = []
         prev = input_dim
         for h in self.hidden_dims:
-            enc += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()]
+            enc.extend([nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()])
             prev = h
         self.encoder = nn.Sequential(*enc)
         self.fc_mu = nn.Linear(prev, latent_dim)
         self.fc_logvar = nn.Linear(prev, latent_dim)
 
+        # -------- Decoder --------
         dec = []
         prev = latent_dim
         for h in reversed(self.hidden_dims):
-            dec += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()]
+            dec.extend([nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()])
             prev = h
-        dec.append(nn.Linear(prev, input_dim))
+        dec.append(nn.Linear(prev, reconstruction_dim))
         self.decoder = nn.Sequential(*dec)
 
         self.to(self.device)
@@ -54,27 +73,31 @@ class FinancialVAE(nn.Module):
         std = torch.exp(0.5 * logvar)
         return mu + torch.randn_like(std) * std
 
-    def decode(self, z):
-        return self.decoder(z)
-
     def forward(self, x):
         mu, logvar = self.encode_net(x)
         z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
+        return self.decoder(z), mu, logvar
 
-    def _loss(self, xhat, x, mu, logvar):
-        recon = nn.functional.mse_loss(xhat, x, reduction="mean")
+    def _loss(self, xhat, x_behaviour, mu, logvar):
+        recon = nn.functional.mse_loss(xhat, x_behaviour, reduction="mean")
         kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         return recon + self.beta * kl, recon, kl
 
-    def fit(self, X, validation_size=0.2, random_state=42):
-        Xtr, Xva = train_test_split(X, test_size=validation_size,
-                                    random_state=random_state)
+    def fit(self, X):
+        Xb = X[:, :self.reconstruction_dim]
 
-        tr = DataLoader(TensorDataset(torch.tensor(Xtr, dtype=torch.float32)),
-                        batch_size=self.batch_size, shuffle=True)
-        va = DataLoader(TensorDataset(torch.tensor(Xva, dtype=torch.float32)),
-                        batch_size=self.batch_size, shuffle=False)
+        Xtr, Xva, Ytr, Yva = train_test_split(
+            X, Xb, test_size=0.2, random_state=42
+        )
+
+        tr = DataLoader(
+            TensorDataset(torch.FloatTensor(Xtr), torch.FloatTensor(Ytr)),
+            batch_size=self.batch_size, shuffle=True
+        )
+        va = DataLoader(
+            TensorDataset(torch.FloatTensor(Xva), torch.FloatTensor(Yva)),
+            batch_size=self.batch_size, shuffle=False
+        )
 
         opt = torch.optim.Adam(self.parameters(), lr=self.lr)
 
@@ -84,13 +107,13 @@ class FinancialVAE(nn.Module):
 
         for epoch in range(self.epochs):
             self.train()
-            tr_loss = tr_rec = tr_kl = 0.0
+            tr_loss = tr_rec = tr_kl = 0
 
-            for (x,) in tr:
-                x = x.to(self.device)
+            for x, y in tr:
+                x, y = x.to(self.device), y.to(self.device)
                 opt.zero_grad()
                 xhat, mu, logvar = self(x)
-                loss, rec, kl = self._loss(xhat, x, mu, logvar)
+                loss, rec, kl = self._loss(xhat, y, mu, logvar)
                 loss.backward()
                 opt.step()
 
@@ -103,12 +126,12 @@ class FinancialVAE(nn.Module):
             tr_kl /= len(tr)
 
             self.eval()
-            val_loss = 0.0
+            val_loss = 0
             with torch.no_grad():
-                for (x,) in va:
-                    x = x.to(self.device)
+                for x, y in va:
+                    x, y = x.to(self.device), y.to(self.device)
                     xhat, mu, logvar = self(x)
-                    loss, _, _ = self._loss(xhat, x, mu, logvar)
+                    loss, _, _ = self._loss(xhat, y, mu, logvar)
                     val_loss += loss.item()
             val_loss /= len(va)
 
@@ -130,42 +153,44 @@ class FinancialVAE(nn.Module):
                     print("Early stopping.")
                     break
 
-        if best_state is not None:
-            self.load_state_dict(best_state)
+        self.load_state_dict(best_state)
 
     def encode(self, X):
         self.eval()
         with torch.no_grad():
-            x = torch.tensor(X, dtype=torch.float32).to(self.device)
+            x = torch.FloatTensor(X).to(self.device)
             mu, _ = self.encode_net(x)
         return mu.cpu().numpy()
 
     def reconstruct(self, X):
         self.eval()
         with torch.no_grad():
-            x = torch.tensor(X, dtype=torch.float32).to(self.device)
+            x = torch.FloatTensor(X).to(self.device)
             xhat, _, _ = self(x)
         return xhat.cpu().numpy()
 
     def reconstruction_error(self, X):
+        xb = X[:, :self.reconstruction_dim]
         xhat = self.reconstruct(X)
-        return np.mean((X - xhat) ** 2, axis=1)
+        return np.mean((xb - xhat) ** 2, axis=1)
 
     def save(self, path):
         joblib.dump({
+            "config": {
+                "input_dim": self.input_dim,
+                "reconstruction_dim": self.reconstruction_dim,
+                "latent_dim": self.latent_dim,
+                "hidden_dims": self.hidden_dims,
+                "beta": self.beta
+            },
             "state_dict": self.state_dict(),
-            "input_dim": self.input_dim,
-            "latent_dim": self.latent_dim,
-            "hidden_dims": self.hidden_dims,
-            "beta": self.beta,
             "history": self.history
         }, path)
 
     @classmethod
     def load(cls, path):
         obj = joblib.load(path)
-        model = cls(obj["input_dim"], obj["latent_dim"],
-                    obj["hidden_dims"], obj["beta"])
-        model.load_state_dict(obj["state_dict"])
-        model.history = obj["history"]
-        return model
+        m = cls(**obj["config"])
+        m.load_state_dict(obj["state_dict"])
+        m.history = obj["history"]
+        return m
