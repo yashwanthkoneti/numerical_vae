@@ -1,0 +1,199 @@
+
+"""
+financial_preprocessor.py
+
+Reusable preprocessing pipeline for Financial VAE.
+
+Responsibilities
+----------------
+1. Preserve structural missingness using indicator variables.
+2. Fill structural missing values with 0.0.
+3. Fit and apply a StandardScaler on behavioural features only.
+4. Save / load preprocessing artifacts.
+"""
+
+import json
+import joblib
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+
+
+class FinancialPreprocessor:
+
+    def __init__(self):
+        self.feature_columns = None
+        self.behavior_columns = None
+        self.indicator_columns = None
+        self.missing_columns = None
+
+        self.scaler = StandardScaler()
+
+        self.metadata = {}
+
+        self.is_fitted = False
+
+    # -------------------------------------------------------
+
+    def fit(self, df: pd.DataFrame, id_column="client_id"):
+
+        df = df.copy()
+
+        self.feature_columns = [
+            c for c in df.columns
+            if c != id_column
+        ]
+
+        # Columns having structural missing values
+        self.missing_columns = [
+            c for c in self.feature_columns
+            if df[c].isnull().sum() > 0
+        ]
+
+        # Create missing indicators
+        for col in self.missing_columns:
+            df[f"{col}_missing"] = (
+                df[col].isnull().astype(np.int8)
+            )
+
+        self.indicator_columns = [
+            f"{c}_missing"
+            for c in self.missing_columns
+        ]
+
+        # Behaviour columns only
+        self.behavior_columns = self.feature_columns.copy()
+
+        # Fill structural missing values
+        df[self.missing_columns] = (
+            df[self.missing_columns]
+            .fillna(0.0)
+        )
+
+        # Fit scaler
+        self.scaler.fit(df[self.behavior_columns])
+
+        self.metadata = {
+            "id_column": id_column,
+            "behavior_columns": self.behavior_columns,
+            "indicator_columns": self.indicator_columns,
+            "missing_columns": self.missing_columns,
+            "n_behavior_features": len(self.behavior_columns),
+            "n_indicator_features": len(self.indicator_columns),
+            "input_dimension":
+                len(self.behavior_columns)
+                + len(self.indicator_columns)
+        }
+
+        self.is_fitted = True
+
+        return self
+
+    # -------------------------------------------------------
+
+    def transform(self, df: pd.DataFrame):
+
+        if not self.is_fitted:
+            raise RuntimeError(
+                "Call fit() before transform()."
+            )
+
+        df = df.copy()
+
+        # Missing indicators
+        for col in self.missing_columns:
+            df[f"{col}_missing"] = (
+                df[col].isnull().astype(np.int8)
+            )
+
+        # Fill missing
+        df[self.missing_columns] = (
+            df[self.missing_columns]
+            .fillna(0.0)
+        )
+
+        # Scale behavioural variables
+        X_behavior = self.scaler.transform(
+            df[self.behavior_columns]
+        )
+
+        X_indicator = (
+            df[self.indicator_columns]
+            .values
+            .astype(np.float32)
+        )
+
+        X = np.hstack([
+            X_behavior.astype(np.float32),
+            X_indicator
+        ])
+
+        return X
+
+    # -------------------------------------------------------
+
+    def fit_transform(self, df, id_column="client_id"):
+
+        self.fit(df, id_column=id_column)
+
+        return self.transform(df)
+
+    # -------------------------------------------------------
+
+    def save(self, folder):
+
+        joblib.dump(
+            self.scaler,
+            f"{folder}/scaler.joblib"
+        )
+
+        with open(
+            f"{folder}/metadata.json",
+            "w"
+        ) as f:
+
+            json.dump(
+                self.metadata,
+                f,
+                indent=4
+            )
+
+    # -------------------------------------------------------
+
+    def load(self, folder):
+
+        self.scaler = joblib.load(
+            f"{folder}/scaler.joblib"
+        )
+
+        with open(
+            f"{folder}/metadata.json",
+            "r"
+        ) as f:
+
+            self.metadata = json.load(f)
+
+        self.behavior_columns = self.metadata["behavior_columns"]
+        self.indicator_columns = self.metadata["indicator_columns"]
+        self.missing_columns = self.metadata["missing_columns"]
+
+        self.is_fitted = True
+
+        return self
+
+    # -------------------------------------------------------
+
+    def summary(self):
+
+        if not self.is_fitted:
+            print("Preprocessor not fitted.")
+            return
+
+        print("=" * 60)
+        print("FinancialPreprocessor")
+        print("=" * 60)
+        print(f"Behaviour Features : {len(self.behavior_columns)}")
+        print(f"Missing Indicators : {len(self.indicator_columns)}")
+        print(f"Input Dimension    : {self.metadata['input_dimension']}")
+        print("=" * 60)
