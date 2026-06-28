@@ -1,0 +1,171 @@
+
+import copy
+import joblib
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+
+
+class FinancialVAE(nn.Module):
+
+    def __init__(self, input_dim, latent_dim=8, hidden_dims=None,
+                 beta=1.0, lr=1e-3, batch_size=512,
+                 epochs=30, patience=5, device=None):
+
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.hidden_dims = hidden_dims or [2 * input_dim, input_dim]
+        self.beta = beta
+        self.lr = lr
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.history = {"train": [], "val": [], "recon": [], "kl": []}
+
+        enc = []
+        prev = input_dim
+        for h in self.hidden_dims:
+            enc += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()]
+            prev = h
+        self.encoder = nn.Sequential(*enc)
+        self.fc_mu = nn.Linear(prev, latent_dim)
+        self.fc_logvar = nn.Linear(prev, latent_dim)
+
+        dec = []
+        prev = latent_dim
+        for h in reversed(self.hidden_dims):
+            dec += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()]
+            prev = h
+        dec.append(nn.Linear(prev, input_dim))
+        self.decoder = nn.Sequential(*dec)
+
+        self.to(self.device)
+
+    def encode_net(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, logvar = self.encode_net(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+    def _loss(self, xhat, x, mu, logvar):
+        recon = nn.functional.mse_loss(xhat, x, reduction="mean")
+        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        return recon + self.beta * kl, recon, kl
+
+    def fit(self, X, validation_size=0.2, random_state=42):
+        Xtr, Xva = train_test_split(X, test_size=validation_size,
+                                    random_state=random_state)
+
+        tr = DataLoader(TensorDataset(torch.tensor(Xtr, dtype=torch.float32)),
+                        batch_size=self.batch_size, shuffle=True)
+        va = DataLoader(TensorDataset(torch.tensor(Xva, dtype=torch.float32)),
+                        batch_size=self.batch_size, shuffle=False)
+
+        opt = torch.optim.Adam(self.parameters(), lr=self.lr)
+
+        best_loss = np.inf
+        best_state = None
+        wait = 0
+
+        for epoch in range(self.epochs):
+            self.train()
+            tr_loss = tr_rec = tr_kl = 0.0
+
+            for (x,) in tr:
+                x = x.to(self.device)
+                opt.zero_grad()
+                xhat, mu, logvar = self(x)
+                loss, rec, kl = self._loss(xhat, x, mu, logvar)
+                loss.backward()
+                opt.step()
+
+                tr_loss += loss.item()
+                tr_rec += rec.item()
+                tr_kl += kl.item()
+
+            tr_loss /= len(tr)
+            tr_rec /= len(tr)
+            tr_kl /= len(tr)
+
+            self.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for (x,) in va:
+                    x = x.to(self.device)
+                    xhat, mu, logvar = self(x)
+                    loss, _, _ = self._loss(xhat, x, mu, logvar)
+                    val_loss += loss.item()
+            val_loss /= len(va)
+
+            self.history["train"].append(tr_loss)
+            self.history["val"].append(val_loss)
+            self.history["recon"].append(tr_rec)
+            self.history["kl"].append(tr_kl)
+
+            print(f"Epoch {epoch+1:03d} | Train {tr_loss:.5f} | "
+                  f"Val {val_loss:.5f} | Recon {tr_rec:.5f} | KL {tr_kl:.5f}")
+
+            if val_loss < best_loss:
+                best_loss = val_loss
+                best_state = copy.deepcopy(self.state_dict())
+                wait = 0
+            else:
+                wait += 1
+                if wait >= self.patience:
+                    print("Early stopping.")
+                    break
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
+
+    def encode(self, X):
+        self.eval()
+        with torch.no_grad():
+            x = torch.tensor(X, dtype=torch.float32).to(self.device)
+            mu, _ = self.encode_net(x)
+        return mu.cpu().numpy()
+
+    def reconstruct(self, X):
+        self.eval()
+        with torch.no_grad():
+            x = torch.tensor(X, dtype=torch.float32).to(self.device)
+            xhat, _, _ = self(x)
+        return xhat.cpu().numpy()
+
+    def reconstruction_error(self, X):
+        xhat = self.reconstruct(X)
+        return np.mean((X - xhat) ** 2, axis=1)
+
+    def save(self, path):
+        joblib.dump({
+            "state_dict": self.state_dict(),
+            "input_dim": self.input_dim,
+            "latent_dim": self.latent_dim,
+            "hidden_dims": self.hidden_dims,
+            "beta": self.beta,
+            "history": self.history
+        }, path)
+
+    @classmethod
+    def load(cls, path):
+        obj = joblib.load(path)
+        model = cls(obj["input_dim"], obj["latent_dim"],
+                    obj["hidden_dims"], obj["beta"])
+        model.load_state_dict(obj["state_dict"])
+        model.history = obj["history"]
+        return model
